@@ -10,21 +10,24 @@ import Combine
 
 enum CallState: Equatable {
     case idle
-    case calling        // outgoing, waiting for answer
-    case ringing        // incoming, waiting for us to accept
-    case inCall         // connected
+    case calling
+    case ringing
+    case inCall
 }
 
 // MARK: - Signalling Constants
 
-let kCallInviteSignal  = "[[CALL_INVITE]]"
-let kCallAcceptSignal  = "[[CALL_ACCEPT]]"
-let kCallEndSignal     = "[[CALL_END]]"
+let kCallInviteSignal   = "[[CALL_INVITE]]"
+let kCallAcceptSignal   = "[[CALL_ACCEPT]]"
+let kCallEndSignal      = "[[CALL_END]]"
+let kCallDeclineSignal  = "[[CALL_DECLINE]]"
+let kCallLogPrefix      = "[[CALL_LOG]]"   // [[CALL_LOG]]:Missed | :Declined | :Ended:05:20
 
-/// Legacy alias kept for CallManager compatibility.
-let kCallRingingSignal = kCallInviteSignal
+let kCallRingingSignal  = kCallInviteSignal   // legacy alias
 
-private let kAllSignals: Set<String> = [kCallInviteSignal, kCallAcceptSignal, kCallEndSignal]
+private let kAllSignals: Set<String> = [
+    kCallInviteSignal, kCallAcceptSignal, kCallEndSignal, kCallDeclineSignal
+]
 
 // MARK: - WebSocketManager
 
@@ -33,8 +36,15 @@ final class WebSocketManager: ObservableObject {
     // MARK: Published State
     @Published var messages: [ChatMessage] = []
     @Published var isConnected: Bool = false
-    @Published var currentCallState: CallState = .idle
+    @Published var currentCallState: CallState = .idle {
+        didSet { if currentCallState == .inCall { callStartTime = Date() } }
+    }
     @Published var activeCallPartnerName: String = ""
+
+    // MARK: Call Tracking
+    var callStartTime: Date? = nil
+    /// Only the device that sent CALL_INVITE generates the [[CALL_LOG]] card.
+    var isCaller: Bool = false
 
     // MARK: Private
     private var task: URLSessionWebSocketTask?
@@ -42,7 +52,7 @@ final class WebSocketManager: ObservableObject {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    // MARK: - Connect
+    // MARK: - Connect / Disconnect
 
     func connect() {
         task = URLSession.shared.webSocketTask(with: url)
@@ -50,8 +60,6 @@ final class WebSocketManager: ObservableObject {
         isConnected = true
         receiveMessages()
     }
-
-    // MARK: - Disconnect
 
     func disconnect() {
         task?.cancel(with: .goingAway, reason: nil)
@@ -66,7 +74,7 @@ final class WebSocketManager: ObservableObject {
             switch result {
             case .success(let message):
                 switch message {
-                case .string(let json):       self.handleIncoming(jsonString: json)
+                case .string(let json):  self.handleIncoming(jsonString: json)
                 case .data(let data):
                     if let json = String(data: data, encoding: .utf8) { self.handleIncoming(jsonString: json) }
                 @unknown default: break
@@ -88,12 +96,12 @@ final class WebSocketManager: ObservableObject {
             return
         }
 
-        // ── Signalling intercept (plain text, before decryption) ──────────────
         switch raw.text {
 
         case kCallInviteSignal:
             print("[WebSocketManager] CALL_INVITE from '\(raw.senderName)'")
             DispatchQueue.main.async {
+                self.isCaller = false
                 self.activeCallPartnerName = raw.senderName
                 self.currentCallState = .ringing
                 CallManager.shared.reportIncomingCall(uuid: UUID(), callerName: raw.senderName)
@@ -101,26 +109,44 @@ final class WebSocketManager: ObservableObject {
             return
 
         case kCallAcceptSignal:
-            print("[WebSocketManager] CALL_ACCEPT from '\(raw.senderName)' — call is now connected")
-            DispatchQueue.main.async {
-                self.currentCallState = .inCall
-            }
+            print("[WebSocketManager] CALL_ACCEPT — call connected")
+            DispatchQueue.main.async { self.currentCallState = .inCall }
             return
 
         case kCallEndSignal:
-            print("[WebSocketManager] CALL_END from '\(raw.senderName)' — call terminated")
+            // Remote peer ended the call.
+            print("[WebSocketManager] CALL_END from '\(raw.senderName)'")
             DispatchQueue.main.async {
-                self.currentCallState = .idle
-                self.activeCallPartnerName = ""
+                // Caller generates the log; callee just resets.
+                self.terminateCall(reason: "Ended", senderId: raw.senderName, senderName: raw.senderName)
+                CallManager.shared.endActiveCall()
+            }
+            return
+
+        case kCallDeclineSignal:
+            // Receiver declined the ringing call.
+            print("[WebSocketManager] CALL_DECLINE from '\(raw.senderName)'")
+            DispatchQueue.main.async {
+                self.terminateCall(reason: "Declined", senderId: raw.senderName, senderName: raw.senderName)
                 CallManager.shared.endActiveCall()
             }
             return
 
         default:
-            break   // fall through to normal message handling
+            break
         }
 
-        // ── Regular encrypted message ─────────────────────────────────────────
+        // ── Call-log card (plain text, sent by caller) ────────────────────────
+        if raw.text.hasPrefix(kCallLogPrefix) {
+            let logMessage = ChatMessage(
+                id: raw.id, senderId: raw.senderId,
+                senderName: raw.senderName, text: raw.text, timestamp: raw.timestamp
+            )
+            DispatchQueue.main.async { self.messages.append(logMessage) }
+            return
+        }
+
+        // ── Regular encrypted chat message ────────────────────────────────────
         guard let decryptedText = CryptoManager.shared.decrypt(base64String: raw.text) else {
             print("[WebSocketManager] Decryption failed — dropping message")
             return
@@ -135,11 +161,12 @@ final class WebSocketManager: ObservableObject {
     // MARK: - Send
 
     func sendMessage(text: String, senderId: String, senderName: String) {
-        let isSignal = kAllSignals.contains(text)
+        let isSignal  = kAllSignals.contains(text)
+        let isCallLog = text.hasPrefix(kCallLogPrefix)
 
         let wireText: String
-        if isSignal {
-            wireText = text     // signals travel unencrypted
+        if isSignal || isCallLog {
+            wireText = text   // plain text — no encryption
         } else {
             guard let encrypted = CryptoManager.shared.encrypt(message: text) else {
                 print("[WebSocketManager] Encryption failed — message not sent")
@@ -156,10 +183,61 @@ final class WebSocketManager: ObservableObject {
             if let error { print("[WebSocketManager] Send error: \(error.localizedDescription)") }
         }
 
-        // Only append regular messages to the chat history.
-        // Signalling tokens must not appear in the conversation history.
+        if text == kCallInviteSignal {
+            DispatchQueue.main.async { self.isCaller = true }
+        }
+
+        // Append locally for non-signal messages (chat + call-log cards).
         guard !isSignal else { return }
         let local = ChatMessage(senderId: senderId, senderName: senderName, text: text)
         DispatchQueue.main.async { self.messages.append(local) }
+    }
+
+    // MARK: - Terminate Call (centralised)
+
+    /// Single entry point for ending a call from any trigger (button tap, remote signal).
+    /// Only the **caller** (`isCaller == true`) generates and broadcasts the [[CALL_LOG]] card.
+    ///
+    /// - Parameters:
+    ///   - reason:     "Ended" | "Declined" | "Missed" — determines the log card text.
+    ///   - senderId / senderName: identity to stamp on the log message (caller's identity).
+    func terminateCall(reason: String, senderId: String, senderName: String) {
+        defer {
+            // Always reset call state regardless of caller role.
+            currentCallState = .idle
+            activeCallPartnerName = ""
+            callStartTime = nil
+            isCaller = false
+        }
+
+        guard isCaller else {
+            print("[WebSocketManager] terminateCall: callee side — resetting state only")
+            return
+        }
+
+        // Build the log text based on reason and previous state.
+        let logText: String
+        switch reason {
+        case "Ended":
+            // Call was answered and connected — calculate real duration.
+            let secs: Int
+            if let start = callStartTime {
+                secs = max(0, Int(Date().timeIntervalSince(start)))
+            } else {
+                secs = 0
+            }
+            let formatted = String(format: "%02d:%02d", secs / 60, secs % 60)
+            logText = "\(kCallLogPrefix):Ended:\(formatted)"
+
+        case "Declined":
+            logText = "\(kCallLogPrefix):Declined"
+
+        default:
+            // "Missed" or any unrecognised reason.
+            logText = "\(kCallLogPrefix):Missed"
+        }
+
+        print("[WebSocketManager] terminateCall: caller generating log '\(logText)'")
+        sendMessage(text: logText, senderId: senderId, senderName: senderName)
     }
 }

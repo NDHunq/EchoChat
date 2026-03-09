@@ -146,6 +146,7 @@ struct CallView: View {
     // MARK: - Actions
 
     private func acceptCall() {
+        // Callee accepts — tell caller the call is connected.
         webSocketManager.sendMessage(
             text: kCallAcceptSignal,
             senderId: currentUser,
@@ -157,14 +158,46 @@ struct CallView: View {
     }
 
     private func endCall() {
-        webSocketManager.sendMessage(
-            text: kCallEndSignal,
-            senderId: currentUser,
-            senderName: currentUser
-        )
-        webSocketManager.currentCallState = .idle
-        webSocketManager.activeCallPartnerName = ""
         timerRunning = false
+
+        if webSocketManager.isCaller {
+            // ── Caller ends the call ──────────────────────────────────────
+            // Determine log reason before state is reset inside terminateCall.
+            let reason: String
+            switch webSocketManager.currentCallState {
+            case .inCall:   reason = "Ended"
+            case .calling:  reason = "Missed"   // rang but never answered
+            default:        reason = "Missed"
+            }
+            // Generate + broadcast the [[CALL_LOG]] card, then reset state.
+            webSocketManager.terminateCall(
+                reason: reason,
+                senderId: currentUser,
+                senderName: currentUser
+            )
+            // Notify the remote peer to close their CallView.
+            webSocketManager.sendMessage(
+                text: kCallEndSignal,
+                senderId: currentUser,
+                senderName: currentUser
+            )
+        } else {
+            // ── Callee ends / declines the call ──────────────────────────
+            let signal = webSocketManager.currentCallState == .ringing
+                ? kCallDeclineSignal    // declined before answering
+                : kCallEndSignal        // ended after answering
+            webSocketManager.sendMessage(
+                text: signal,
+                senderId: currentUser,
+                senderName: currentUser
+            )
+            // Callee just resets local state — no log generation.
+            webSocketManager.currentCallState = .idle
+            webSocketManager.activeCallPartnerName = ""
+            webSocketManager.callStartTime = nil
+            webSocketManager.isCaller = false
+        }
+
         CallManager.shared.endActiveCall()
         dismiss()
     }
