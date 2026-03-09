@@ -49,9 +49,13 @@ struct ChatView: View {
     let conversationTitle: String
 
     @StateObject private var webSocketManager = WebSocketManager()
-    @AppStorage("currentUser") private var currentUser: String = ""
     @State private var newMessage: String = ""
     @State private var isCallPresented: Bool = false
+
+    /// The current user's identity, read from the Keychain (secure store).
+    private var currentUser: String {
+        KeychainManager.shared.load(key: KeychainManager.currentUserKey) ?? "Unknown"
+    }
 
     var body: some View {
         VStack(spacing: 0) {

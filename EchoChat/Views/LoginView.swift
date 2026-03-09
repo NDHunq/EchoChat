@@ -2,16 +2,14 @@
 //  LoginView.swift
 //  EchoChat
 //
-//  Login screen for MiniOTTChat. Accepts email and password,
-//  then navigates to the conversation list.
-//  State is managed by LoginViewModel (MVVM).
+//  First-launch identity setup. Saves the username to the Keychain
+//  (replaces @AppStorage / UserDefaults).
 //
 
 import SwiftUI
 
 struct LoginView: View {
     @StateObject private var viewModel = LoginViewModel()
-    @AppStorage("currentUser") private var currentUser: String = ""
 
     var body: some View {
         NavigationStack {
@@ -65,14 +63,14 @@ struct LoginView: View {
 
                 // MARK: - Login Button
                 Button {
-                    // Persist the entered name so ChatView can read it via @AppStorage
-                    currentUser = viewModel.email.trimmingCharacters(in: .whitespaces)
+                    let name = viewModel.email.trimmingCharacters(in: .whitespaces)
+                    // Persist identity securely in the Keychain instead of UserDefaults.
+                    KeychainManager.shared.save(key: KeychainManager.currentUserKey, data: name)
                     viewModel.login()
                 } label: {
                     Group {
                         if viewModel.isLoading {
-                            ProgressView()
-                                .tint(.white)
+                            ProgressView().tint(.white)
                         } else {
                             Text("Login")
                                 .font(.headline)
