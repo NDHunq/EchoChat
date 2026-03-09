@@ -80,33 +80,54 @@ final class WebSocketManager: ObservableObject {
     private func handleIncoming(jsonString: String) {
         guard let data = jsonString.data(using: .utf8) else { return }
         do {
-            let chatMessage = try decoder.decode(ChatMessage.self, from: data)
+            var chatMessage = try decoder.decode(ChatMessage.self, from: data)
+
+            // Decrypt the cipher-text received from the server back to plain text.
+            if let decryptedText = CryptoManager.shared.decrypt(base64String: chatMessage.text) {
+                chatMessage = ChatMessage(
+                    id: chatMessage.id,
+                    senderId: chatMessage.senderId,
+                    senderName: chatMessage.senderName,
+                    text: decryptedText,
+                    timestamp: chatMessage.timestamp
+                )
+            } else {
+                print("[WebSocketManager] Decryption failed — dropping message")
+                return
+            }
+
             DispatchQueue.main.async {
                 self.messages.append(chatMessage)
             }
         } catch {
             print("[WebSocketManager] Decode error: \(error.localizedDescription)")
-            // TODO: Handle malformed messages (show error banner, skip, etc.).
         }
     }
 
     // MARK: - Send
 
-    /// Encodes a new ChatMessage to JSON and sends it over the socket.
+    /// Encrypts the message text, encodes it as JSON, and sends it over the socket.
     /// Because the backend does NOT echo back to the sender, we also
-    /// append the message locally so it appears in the sender's UI immediately.
+    /// append the message in plain text locally so it appears in the sender's UI immediately.
     func sendMessage(text: String, senderId: String, senderName: String) {
-        let chatMessage = ChatMessage(
+
+        // 1. Encrypt the plain text — only the cipher-text travels over the network.
+        guard let encryptedText = CryptoManager.shared.encrypt(message: text) else {
+            print("[WebSocketManager] Encryption failed — message not sent")
+            return
+        }
+
+        // 2. Build the wire payload with the encrypted text.
+        let wireMessage = ChatMessage(
             senderId: senderId,
             senderName: senderName,
-            text: text
+            text: encryptedText         // ← cipher-text goes to the server
         )
 
-        // TODO: Encrypt the payload before encoding (E2E encryption layer).
         // TODO: Add message delivery status tracking (sent / delivered / read).
 
         do {
-            let data = try encoder.encode(chatMessage)
+            let data = try encoder.encode(wireMessage)
             guard let jsonString = String(data: data, encoding: .utf8) else { return }
 
             task?.send(.string(jsonString)) { error in
@@ -119,9 +140,14 @@ final class WebSocketManager: ObservableObject {
             print("[WebSocketManager] Encode error: \(error.localizedDescription)")
         }
 
-        // Append locally — backend does not echo to the sender.
+        // 3. Append locally in plain text — backend does not echo to the sender.
+        let localMessage = ChatMessage(
+            senderId: senderId,
+            senderName: senderName,
+            text: text                  // ← plain text shown in sender's UI
+        )
         DispatchQueue.main.async {
-            self.messages.append(chatMessage)
+            self.messages.append(localMessage)
         }
     }
 }
