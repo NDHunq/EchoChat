@@ -2,23 +2,41 @@
 //  WebSocketManager.swift
 //  EchoChat
 //
-//  Manages the WebSocket connection to the Node.js backend at ws://localhost:8080.
-//  Uses URLSessionWebSocketTask (native, no third-party dependency).
-//
 
 import Foundation
 import Combine
 
+// MARK: - Call State
+
+enum CallState: Equatable {
+    case idle
+    case calling        // outgoing, waiting for answer
+    case ringing        // incoming, waiting for us to accept
+    case inCall         // connected
+}
+
+// MARK: - Signalling Constants
+
+let kCallInviteSignal  = "[[CALL_INVITE]]"
+let kCallAcceptSignal  = "[[CALL_ACCEPT]]"
+let kCallEndSignal     = "[[CALL_END]]"
+
+/// Legacy alias kept for CallManager compatibility.
+let kCallRingingSignal = kCallInviteSignal
+
+private let kAllSignals: Set<String> = [kCallInviteSignal, kCallAcceptSignal, kCallEndSignal]
+
+// MARK: - WebSocketManager
+
 final class WebSocketManager: ObservableObject {
-    // MARK: - Published State
 
-    /// All messages in the current session (sent + received).
+    // MARK: Published State
     @Published var messages: [ChatMessage] = []
-    /// Whether the socket is currently connected.
     @Published var isConnected: Bool = false
+    @Published var currentCallState: CallState = .idle
+    @Published var activeCallPartnerName: String = ""
 
-    // MARK: - Private
-
+    // MARK: Private
     private var task: URLSessionWebSocketTask?
     private let url = URL(string: "ws://localhost:8080")!
     private let decoder = JSONDecoder()
@@ -26,9 +44,7 @@ final class WebSocketManager: ObservableObject {
 
     // MARK: - Connect
 
-    /// Opens the WebSocket connection and begins listening for messages.
     func connect() {
-        // TODO: Replace hard-coded URL with a configurable environment constant.
         task = URLSession.shared.webSocketTask(with: url)
         task?.resume()
         isConnected = true
@@ -44,93 +60,87 @@ final class WebSocketManager: ObservableObject {
 
     // MARK: - Receive (recursive)
 
-    /// Continuously listens for incoming frames using a recursive receive loop.
     private func receiveMessages() {
         task?.receive { [weak self] result in
             guard let self else { return }
-
             switch result {
             case .success(let message):
                 switch message {
-                case .string(let jsonString):
-                    self.handleIncoming(jsonString: jsonString)
+                case .string(let json):       self.handleIncoming(jsonString: json)
                 case .data(let data):
-                    // Fallback: treat raw data as UTF-8 JSON.
-                    if let jsonString = String(data: data, encoding: .utf8) {
-                        self.handleIncoming(jsonString: jsonString)
-                    }
-                @unknown default:
-                    break
+                    if let json = String(data: data, encoding: .utf8) { self.handleIncoming(jsonString: json) }
+                @unknown default: break
                 }
-                // Keep the loop alive for the next message.
                 self.receiveMessages()
-
             case .failure(let error):
-                DispatchQueue.main.async {
-                    self.isConnected = false
-                }
+                DispatchQueue.main.async { self.isConnected = false }
                 print("[WebSocketManager] Receive error: \(error.localizedDescription)")
-                // TODO: Implement reconnection back-off strategy.
             }
         }
     }
 
-    // MARK: - Handle Incoming JSON
+    // MARK: - Handle Incoming
 
     private func handleIncoming(jsonString: String) {
-        guard let data = jsonString.data(using: .utf8) else { return }
-
-        // Step 1: Decode the outer envelope to inspect the raw text field.
-        guard let rawMessage = try? decoder.decode(ChatMessage.self, from: data) else {
+        guard let data = jsonString.data(using: .utf8),
+              let raw = try? decoder.decode(ChatMessage.self, from: data) else {
             print("[WebSocketManager] Decode error — dropping frame")
             return
         }
 
-        // Step 2: Check for call-signalling token BEFORE attempting decryption.
-        // The signal token is sent in plain text so all clients can detect it.
-        if rawMessage.text == kCallRingingSignal {
-            let callerName = rawMessage.senderName
-            let callUUID   = UUID()
-            print("[WebSocketManager] CALL_RINGING received from '\(callerName)' — reporting to CallKit")
+        // ── Signalling intercept (plain text, before decryption) ──────────────
+        switch raw.text {
+
+        case kCallInviteSignal:
+            print("[WebSocketManager] CALL_INVITE from '\(raw.senderName)'")
             DispatchQueue.main.async {
-                CallManager.shared.reportIncomingCall(uuid: callUUID, callerName: callerName)
+                self.activeCallPartnerName = raw.senderName
+                self.currentCallState = .ringing
+                CallManager.shared.reportIncomingCall(uuid: UUID(), callerName: raw.senderName)
             }
-            return  // Do NOT add this to the chat message list.
+            return
+
+        case kCallAcceptSignal:
+            print("[WebSocketManager] CALL_ACCEPT from '\(raw.senderName)' — call is now connected")
+            DispatchQueue.main.async {
+                self.currentCallState = .inCall
+            }
+            return
+
+        case kCallEndSignal:
+            print("[WebSocketManager] CALL_END from '\(raw.senderName)' — call terminated")
+            DispatchQueue.main.async {
+                self.currentCallState = .idle
+                self.activeCallPartnerName = ""
+                CallManager.shared.endActiveCall()
+            }
+            return
+
+        default:
+            break   // fall through to normal message handling
         }
 
-        // Step 3: Normal message — decrypt and append.
-        if let decryptedText = CryptoManager.shared.decrypt(base64String: rawMessage.text) {
-            let chatMessage = ChatMessage(
-                id: rawMessage.id,
-                senderId: rawMessage.senderId,
-                senderName: rawMessage.senderName,
-                text: decryptedText,
-                timestamp: rawMessage.timestamp
-            )
-            DispatchQueue.main.async {
-                self.messages.append(chatMessage)
-            }
-        } else {
+        // ── Regular encrypted message ─────────────────────────────────────────
+        guard let decryptedText = CryptoManager.shared.decrypt(base64String: raw.text) else {
             print("[WebSocketManager] Decryption failed — dropping message")
+            return
         }
+        let chatMessage = ChatMessage(
+            id: raw.id, senderId: raw.senderId,
+            senderName: raw.senderName, text: decryptedText, timestamp: raw.timestamp
+        )
+        DispatchQueue.main.async { self.messages.append(chatMessage) }
     }
 
     // MARK: - Send
 
-    /// Sends a message over WebSocket.
-    /// - Regular messages are AES-GCM encrypted before sending.
-    /// - Signalling tokens (e.g. "[[CALL_RINGING]]") are sent in plain text
-    ///   and are NOT appended to the local chat list.
     func sendMessage(text: String, senderId: String, senderName: String) {
-        let isSignal = text == kCallRingingSignal
+        let isSignal = kAllSignals.contains(text)
 
-        // Determine the wire payload text.
         let wireText: String
         if isSignal {
-            // Send signalling tokens unencrypted so every peer can detect them.
-            wireText = text
+            wireText = text     // signals travel unencrypted
         } else {
-            // Encrypt regular chat text.
             guard let encrypted = CryptoManager.shared.encrypt(message: text) else {
                 print("[WebSocketManager] Encryption failed — message not sent")
                 return
@@ -139,28 +149,17 @@ final class WebSocketManager: ObservableObject {
         }
 
         let wireMessage = ChatMessage(senderId: senderId, senderName: senderName, text: wireText)
+        guard let data = try? encoder.encode(wireMessage),
+              let json = String(data: data, encoding: .utf8) else { return }
 
-        do {
-            let data = try encoder.encode(wireMessage)
-            guard let jsonString = String(data: data, encoding: .utf8) else { return }
-            task?.send(.string(jsonString)) { error in
-                if let error {
-                    print("[WebSocketManager] Send error: \(error.localizedDescription)")
-                    // TODO: Queue the message for retry on failure.
-                }
-            }
-        } catch {
-            print("[WebSocketManager] Encode error: \(error.localizedDescription)")
-            return
+        task?.send(.string(json)) { error in
+            if let error { print("[WebSocketManager] Send error: \(error.localizedDescription)") }
         }
 
-        // Append to the local chat list only for regular messages.
+        // Only append regular messages to the chat history.
         // Signalling tokens must not appear in the conversation history.
         guard !isSignal else { return }
-
-        let localMessage = ChatMessage(senderId: senderId, senderName: senderName, text: text)
-        DispatchQueue.main.async {
-            self.messages.append(localMessage)
-        }
+        let local = ChatMessage(senderId: senderId, senderName: senderName, text: text)
+        DispatchQueue.main.async { self.messages.append(local) }
     }
 }

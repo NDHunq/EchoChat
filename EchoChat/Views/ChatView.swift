@@ -164,12 +164,16 @@ struct ChatView: View {
 
     @StateObject private var webSocketManager = WebSocketManager()
     @State private var newMessage: String = ""
-    @State private var isCallPresented: Bool = false
-    @State private var incomingCallerName: String = ""
     @FocusState private var inputFocused: Bool
 
     private var currentUser: String {
         KeychainManager.shared.load(key: KeychainManager.currentUserKey) ?? "Unknown"
+    }
+
+    /// Drive the call screen from call state so both outgoing and incoming
+    /// calls open CallView automatically.
+    private var isCallActive: Bool {
+        webSocketManager.currentCallState != .idle
     }
 
     var body: some View {
@@ -260,17 +264,30 @@ struct ChatView: View {
                 }
             }
         }
-        .onAppear { webSocketManager.connect() }
+        .onAppear {
+            webSocketManager.connect()
+            // Bridge CallManager to this WebSocketManager so native CallKit
+            // button taps (Answer / End on real device) can send WebSocket signals.
+            CallManager.shared.webSocketManager = webSocketManager
+            CallManager.shared.currentUser = currentUser
+        }
         .onDisappear { webSocketManager.disconnect() }
-        // Simulator fallback: CallKit cannot show native UI on Simulator,
-        // so CallManager posts a notification → present CallView in-app instead.
+        // Simulator fallback: CallManager posts a notification instead of showing
+        // native CallKit UI → we set state to .ringing which triggers fullScreenCover.
         .onReceive(NotificationCenter.default.publisher(for: kIncomingCallNotification)) { notification in
             let caller = notification.userInfo?[kIncomingCallCallerNameKey] as? String ?? conversationTitle
-            incomingCallerName = caller
-            isCallPresented = true
+            webSocketManager.activeCallPartnerName = caller
+            webSocketManager.currentCallState = .ringing
         }
-        .fullScreenCover(isPresented: $isCallPresented) {
-            CallView(calleeName: incomingCallerName.isEmpty ? conversationTitle : incomingCallerName)
+        // Single source of truth: show CallView whenever a call is active.
+        .fullScreenCover(isPresented: Binding(
+            get: { isCallActive },
+            set: { if !$0 {
+                webSocketManager.currentCallState = .idle
+                webSocketManager.activeCallPartnerName = ""
+            }}
+        )) {
+            CallView(webSocketManager: webSocketManager, currentUser: currentUser)
         }
     }
 
@@ -289,15 +306,15 @@ struct ChatView: View {
 
     // MARK: - Start Call
 
-    /// Broadcasts a [[CALL_RINGING]] signal over WebSocket so all connected
-    /// peers receive a native CallKit incoming-call notification.
-    /// The signal is sent unencrypted and is not shown in the chat history.
     private func startCall() {
+        webSocketManager.activeCallPartnerName = conversationTitle
+        webSocketManager.currentCallState = .calling
         webSocketManager.sendMessage(
-            text: kCallRingingSignal,
+            text: kCallInviteSignal,
             senderId: currentUser,
             senderName: currentUser
         )
+        // No need to set isCallPresented — fullScreenCover reacts to currentCallState != .idle
     }
 }
 
