@@ -165,6 +165,7 @@ struct ChatView: View {
     @StateObject private var webSocketManager = WebSocketManager()
     @State private var newMessage: String = ""
     @State private var isCallPresented: Bool = false
+    @State private var incomingCallerName: String = ""
     @FocusState private var inputFocused: Bool
 
     private var currentUser: String {
@@ -246,13 +247,14 @@ struct ChatView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 HStack(spacing: 14) {
+                    // Connection status dot
                     Circle()
                         .fill(webSocketManager.isConnected ? Color.green : Color(.systemGray3))
                         .frame(width: 8, height: 8)
-                    Button {
-                        isCallPresented = true
-                    } label: {
-                        Image(systemName: "phone.fill")
+
+                    // Video call button — sends CALL_RINGING signal to peers
+                    Button(action: startCall) {
+                        Image(systemName: "video.fill")
                             .foregroundStyle(Color.accentColor)
                     }
                 }
@@ -260,8 +262,15 @@ struct ChatView: View {
         }
         .onAppear { webSocketManager.connect() }
         .onDisappear { webSocketManager.disconnect() }
+        // Simulator fallback: CallKit cannot show native UI on Simulator,
+        // so CallManager posts a notification → present CallView in-app instead.
+        .onReceive(NotificationCenter.default.publisher(for: kIncomingCallNotification)) { notification in
+            let caller = notification.userInfo?[kIncomingCallCallerNameKey] as? String ?? conversationTitle
+            incomingCallerName = caller
+            isCallPresented = true
+        }
         .fullScreenCover(isPresented: $isCallPresented) {
-            CallView(calleeName: conversationTitle)
+            CallView(calleeName: incomingCallerName.isEmpty ? conversationTitle : incomingCallerName)
         }
     }
 
@@ -276,6 +285,19 @@ struct ChatView: View {
             senderName: currentUser
         )
         newMessage = ""
+    }
+
+    // MARK: - Start Call
+
+    /// Broadcasts a [[CALL_RINGING]] signal over WebSocket so all connected
+    /// peers receive a native CallKit incoming-call notification.
+    /// The signal is sent unencrypted and is not shown in the chat history.
+    private func startCall() {
+        webSocketManager.sendMessage(
+            text: kCallRingingSignal,
+            senderId: currentUser,
+            senderName: currentUser
+        )
     }
 }
 

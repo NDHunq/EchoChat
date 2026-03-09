@@ -9,5 +9,10 @@
 	</dict>
 	<key>NSFaceIDUsageDescription</key>
 	<string>EchoChat uses Face ID to protect your secure messages.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
 </dict>
 </plist>

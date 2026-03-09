@@ -79,57 +79,70 @@ final class WebSocketManager: ObservableObject {
 
     private func handleIncoming(jsonString: String) {
         guard let data = jsonString.data(using: .utf8) else { return }
-        do {
-            var chatMessage = try decoder.decode(ChatMessage.self, from: data)
 
-            // Decrypt the cipher-text received from the server back to plain text.
-            if let decryptedText = CryptoManager.shared.decrypt(base64String: chatMessage.text) {
-                chatMessage = ChatMessage(
-                    id: chatMessage.id,
-                    senderId: chatMessage.senderId,
-                    senderName: chatMessage.senderName,
-                    text: decryptedText,
-                    timestamp: chatMessage.timestamp
-                )
-            } else {
-                print("[WebSocketManager] Decryption failed — dropping message")
-                return
+        // Step 1: Decode the outer envelope to inspect the raw text field.
+        guard let rawMessage = try? decoder.decode(ChatMessage.self, from: data) else {
+            print("[WebSocketManager] Decode error — dropping frame")
+            return
+        }
+
+        // Step 2: Check for call-signalling token BEFORE attempting decryption.
+        // The signal token is sent in plain text so all clients can detect it.
+        if rawMessage.text == kCallRingingSignal {
+            let callerName = rawMessage.senderName
+            let callUUID   = UUID()
+            print("[WebSocketManager] CALL_RINGING received from '\(callerName)' — reporting to CallKit")
+            DispatchQueue.main.async {
+                CallManager.shared.reportIncomingCall(uuid: callUUID, callerName: callerName)
             }
+            return  // Do NOT add this to the chat message list.
+        }
 
+        // Step 3: Normal message — decrypt and append.
+        if let decryptedText = CryptoManager.shared.decrypt(base64String: rawMessage.text) {
+            let chatMessage = ChatMessage(
+                id: rawMessage.id,
+                senderId: rawMessage.senderId,
+                senderName: rawMessage.senderName,
+                text: decryptedText,
+                timestamp: rawMessage.timestamp
+            )
             DispatchQueue.main.async {
                 self.messages.append(chatMessage)
             }
-        } catch {
-            print("[WebSocketManager] Decode error: \(error.localizedDescription)")
+        } else {
+            print("[WebSocketManager] Decryption failed — dropping message")
         }
     }
 
     // MARK: - Send
 
-    /// Encrypts the message text, encodes it as JSON, and sends it over the socket.
-    /// Because the backend does NOT echo back to the sender, we also
-    /// append the message in plain text locally so it appears in the sender's UI immediately.
+    /// Sends a message over WebSocket.
+    /// - Regular messages are AES-GCM encrypted before sending.
+    /// - Signalling tokens (e.g. "[[CALL_RINGING]]") are sent in plain text
+    ///   and are NOT appended to the local chat list.
     func sendMessage(text: String, senderId: String, senderName: String) {
+        let isSignal = text == kCallRingingSignal
 
-        // 1. Encrypt the plain text — only the cipher-text travels over the network.
-        guard let encryptedText = CryptoManager.shared.encrypt(message: text) else {
-            print("[WebSocketManager] Encryption failed — message not sent")
-            return
+        // Determine the wire payload text.
+        let wireText: String
+        if isSignal {
+            // Send signalling tokens unencrypted so every peer can detect them.
+            wireText = text
+        } else {
+            // Encrypt regular chat text.
+            guard let encrypted = CryptoManager.shared.encrypt(message: text) else {
+                print("[WebSocketManager] Encryption failed — message not sent")
+                return
+            }
+            wireText = encrypted
         }
 
-        // 2. Build the wire payload with the encrypted text.
-        let wireMessage = ChatMessage(
-            senderId: senderId,
-            senderName: senderName,
-            text: encryptedText         // ← cipher-text goes to the server
-        )
-
-        // TODO: Add message delivery status tracking (sent / delivered / read).
+        let wireMessage = ChatMessage(senderId: senderId, senderName: senderName, text: wireText)
 
         do {
             let data = try encoder.encode(wireMessage)
             guard let jsonString = String(data: data, encoding: .utf8) else { return }
-
             task?.send(.string(jsonString)) { error in
                 if let error {
                     print("[WebSocketManager] Send error: \(error.localizedDescription)")
@@ -138,14 +151,14 @@ final class WebSocketManager: ObservableObject {
             }
         } catch {
             print("[WebSocketManager] Encode error: \(error.localizedDescription)")
+            return
         }
 
-        // 3. Append locally in plain text — backend does not echo to the sender.
-        let localMessage = ChatMessage(
-            senderId: senderId,
-            senderName: senderName,
-            text: text                  // ← plain text shown in sender's UI
-        )
+        // Append to the local chat list only for regular messages.
+        // Signalling tokens must not appear in the conversation history.
+        guard !isSignal else { return }
+
+        let localMessage = ChatMessage(senderId: senderId, senderName: senderName, text: text)
         DispatchQueue.main.async {
             self.messages.append(localMessage)
         }
