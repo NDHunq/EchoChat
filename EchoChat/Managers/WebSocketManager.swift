@@ -22,11 +22,12 @@ let kCallAcceptSignal   = "[[CALL_ACCEPT]]"
 let kCallEndSignal      = "[[CALL_END]]"
 let kCallDeclineSignal  = "[[CALL_DECLINE]]"
 let kCallLogPrefix      = "[[CALL_LOG]]"   // [[CALL_LOG]]:Missed | :Declined | :Ended:05:20
+let kTypingSignal       = "[[TYPING]]"
 
 let kCallRingingSignal  = kCallInviteSignal   // legacy alias
 
 private let kAllSignals: Set<String> = [
-    kCallInviteSignal, kCallAcceptSignal, kCallEndSignal, kCallDeclineSignal
+    kCallInviteSignal, kCallAcceptSignal, kCallEndSignal, kCallDeclineSignal, kTypingSignal
 ]
 
 // MARK: - WebSocketManager
@@ -41,9 +42,14 @@ final class WebSocketManager: ObservableObject {
     }
     @Published var activeCallPartnerName: String = ""
 
+    // MARK: Typing Indicator
+    @Published var isPartnerTyping: Bool = false
+    @Published var typingPartnerName: String = ""
+    private var typingTimer: Timer?
+    private var lastTypingSignalDate: Date?
+
     // MARK: Call Tracking
     var callStartTime: Date? = nil
-    /// Only the device that sent CALL_INVITE generates the [[CALL_LOG]] card.
     var isCaller: Bool = false
 
     // MARK: Private
@@ -124,13 +130,27 @@ final class WebSocketManager: ObservableObject {
             return
 
         case kCallDeclineSignal:
-            // Receiver declined the ringing call.
             print("[WebSocketManager] CALL_DECLINE from '\(raw.senderName)'")
             DispatchQueue.main.async {
                 self.terminateCall(reason: "Declined", senderId: raw.senderName, senderName: raw.senderName)
                 CallManager.shared.endActiveCall()
             }
             return
+
+        case kTypingSignal:
+            DispatchQueue.main.async {
+                self.typingPartnerName = raw.senderName
+                self.isPartnerTyping = true
+                // Reset the auto-hide timer every time a typing signal arrives.
+                self.typingTimer?.invalidate()
+                self.typingTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+                    DispatchQueue.main.async {
+                        self?.isPartnerTyping = false
+                        self?.typingPartnerName = ""
+                    }
+                }
+            }
+            return  // ephemeral — never stored or decrypted
 
         default:
             break
@@ -191,6 +211,23 @@ final class WebSocketManager: ObservableObject {
         guard !isSignal else { return }
         let local = ChatMessage(senderId: senderId, senderName: senderName, text: text)
         DispatchQueue.main.async { self.messages.append(local) }
+    }
+
+    // MARK: - Typing Signal
+
+    /// Sends a [[TYPING]] signal at most once every 2 seconds (debounced).
+    /// The signal is plain text, ephemeral — never encrypted or stored.
+    func sendTypingSignal(senderId: String, senderName: String) {
+        let now = Date()
+        if let last = lastTypingSignalDate, now.timeIntervalSince(last) < 2.0 { return }
+        lastTypingSignalDate = now
+
+        let wireMessage = ChatMessage(senderId: senderId, senderName: senderName, text: kTypingSignal)
+        guard let data = try? encoder.encode(wireMessage),
+              let json = String(data: data, encoding: .utf8) else { return }
+        task?.send(.string(json)) { error in
+            if let error { print("[WebSocketManager] Typing signal error: \(error.localizedDescription)") }
+        }
     }
 
     // MARK: - Terminate Call (centralised)

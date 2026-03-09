@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import Combine
 
 // MARK: - ChatView
 
@@ -56,6 +57,23 @@ struct ChatView: View {
             // MARK: Input Bar
             VStack(spacing: 0) {
                 Divider()
+
+                // ── Typing indicator ──────────────────────────────────────
+                if webSocketManager.isPartnerTyping {
+                    HStack(spacing: 6) {
+                        // Animated dots
+                        TypingDotsView()
+                        Text("\(webSocketManager.typingPartnerName) is typing…")
+                            .font(.caption)
+                            .italic()
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 5)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
                 HStack(alignment: .bottom, spacing: 10) {
                     // Text field
                     TextField("iMessage", text: $newMessage, axis: .vertical)
@@ -70,6 +88,13 @@ struct ChatView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .focused($inputFocused)
                         .onSubmit { send() }
+                        .onChange(of: newMessage) { value in
+                            guard !value.isEmpty else { return }
+                            webSocketManager.sendTypingSignal(
+                                senderId: currentUser,
+                                senderName: currentUser
+                            )
+                        }
 
                     // Send button
                     Button(action: send) {
@@ -96,6 +121,7 @@ struct ChatView: View {
                         .ignoresSafeArea(edges: .bottom)
                 )
             }
+            .animation(.easeInOut(duration: 0.2), value: webSocketManager.isPartnerTyping)
         }
         .navigationTitle(conversationTitle)
         .navigationBarTitleDisplayMode(.inline)
@@ -165,7 +191,28 @@ struct ChatView: View {
             senderId: currentUser,
             senderName: currentUser
         )
-        // No need to set isCallPresented — fullScreenCover reacts to currentCallState != .idle
+    }
+}
+
+// MARK: - Typing Dots Animation
+
+private struct TypingDotsView: View {
+    @State private var phase: Int = 0
+    private let timer = Timer.publish(every: 0.35, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<3) { i in
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 5, height: 5)
+                    .scaleEffect(phase == i ? 1.35 : 0.8)
+                    .animation(.easeInOut(duration: 0.3), value: phase)
+            }
+        }
+        .onReceive(timer) { _ in
+            phase = (phase + 1) % 3
+        }
     }
 }
 
