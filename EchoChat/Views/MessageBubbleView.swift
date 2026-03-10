@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 // MARK: - Timestamp Formatter
 
@@ -228,7 +229,7 @@ struct MessageBubbleView: View {
             .padding(.vertical, 3)
 
         } else {
-            // ── Regular text bubble ───────────────────────────────────────
+            // ── Image bubble OR regular text bubble ───────────────────────
             HStack(alignment: .bottom, spacing: 8) {
                 if isCurrentUser {
                     Spacer(minLength: 60)
@@ -245,15 +246,33 @@ struct MessageBubbleView: View {
                             .padding(.leading, 4)
                     }
 
-                    Text(message.text)
-                        .font(.body)
-                        .foregroundStyle(isCurrentUser ? .white : Color(.label))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            BubbleShape(isCurrentUser: isCurrentUser)
-                                .fill(isCurrentUser ? Color.accentColor : Color(.secondarySystemBackground))
-                        )
+                    if let base64 = message.imageBase64,
+                       let imageData = Data(base64Encoded: base64),
+                       let uiImage = UIImage(data: imageData) {
+                        // ── Image bubble ─────────────────────────────────
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: 220)
+                            .frame(minHeight: 120)
+                            .clipped()
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .strokeBorder(Color(.systemGray5), lineWidth: 0.5)
+                            )
+                    } else {
+                        // ── Text bubble ──────────────────────────────────
+                        Text(message.text)
+                            .font(.body)
+                            .foregroundStyle(isCurrentUser ? .white : Color(.label))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                BubbleShape(isCurrentUser: isCurrentUser)
+                                    .fill(isCurrentUser ? Color.accentColor : Color(.secondarySystemBackground))
+                            )
+                    }
 
                     Text(message.timestamp.formattedMessageTime)
                         .font(.caption2)

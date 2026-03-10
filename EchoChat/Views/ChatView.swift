@@ -8,6 +8,7 @@
 
 import SwiftUI
 import Combine
+import PhotosUI
 
 // MARK: - ChatView
 
@@ -16,6 +17,7 @@ struct ChatView: View {
 
     @StateObject private var webSocketManager = WebSocketManager()
     @State private var newMessage: String = ""
+    @State private var selectedItem: PhotosPickerItem? = nil
     @FocusState private var inputFocused: Bool
 
     private var currentUser: String {
@@ -75,6 +77,27 @@ struct ChatView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 10) {
+                    // Photo picker button
+                    PhotosPicker(selection: $selectedItem, matching: .images) {
+                        Image(systemName: "photo.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 34, height: 34)
+                    }
+                    .onChange(of: selectedItem) { item in
+                        guard let item else { return }
+                        item.loadTransferable(type: Data.self) { result in
+                            if case .success(let data) = result,
+                               let data, let image = UIImage(data: data) {
+                                webSocketManager.sendImage(
+                                    image: image,
+                                    senderId: currentUser,
+                                    senderName: currentUser
+                                )
+                            }
+                            DispatchQueue.main.async { selectedItem = nil }
+                        }
+                    }
                     // Text field
                     TextField("iMessage", text: $newMessage, axis: .vertical)
                         .lineLimit(1...5)

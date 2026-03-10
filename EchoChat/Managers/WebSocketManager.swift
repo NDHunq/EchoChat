@@ -5,6 +5,7 @@
 
 import Foundation
 import Combine
+import UIKit
 
 // MARK: - Call State
 
@@ -62,6 +63,9 @@ final class WebSocketManager: ObservableObject {
 
     func connect() {
         task = URLSession.shared.webSocketTask(with: url)
+        // Increase the receive buffer to 50 MB so encrypted image payloads
+        // don't cause an immediate disconnect (default limit is 1 MB).
+        task?.maximumMessageSize = 50 * 1024 * 1024
         task?.resume()
         isConnected = true
         receiveMessages()
@@ -80,15 +84,33 @@ final class WebSocketManager: ObservableObject {
             switch result {
             case .success(let message):
                 switch message {
-                case .string(let json):  self.handleIncoming(jsonString: json)
+                case .string(let json):
+                    self.handleIncoming(jsonString: json)
                 case .data(let data):
-                    if let json = String(data: data, encoding: .utf8) { self.handleIncoming(jsonString: json) }
-                @unknown default: break
+                    if let json = String(data: data, encoding: .utf8) {
+                        self.handleIncoming(jsonString: json)
+                    } else {
+                        print("[WebSocketManager] Received non-UTF8 data frame — skipping")
+                    }
+                @unknown default:
+                    break
                 }
+                // Always re-arm the listener after a successful receive,
+                // regardless of whether handleIncoming succeeded.
                 self.receiveMessages()
+
             case .failure(let error):
+                let nsError = error as NSError
+                // URLSessionWebSocketTask reports cancellation as NSURLErrorCancelled (-999).
+                // Don't retry in that case — the user deliberately disconnected.
+                if nsError.code == NSURLErrorCancelled {
+                    print("[WebSocketManager] Socket cancelled — stopping receive loop")
+                    return
+                }
+                print("[WebSocketManager] Receive error: \(error.localizedDescription) — retrying loop")
                 DispatchQueue.main.async { self.isConnected = false }
-                print("[WebSocketManager] Receive error: \(error.localizedDescription)")
+                // Retry so a transient frame error doesn't kill the whole session.
+                self.receiveMessages()
             }
         }
     }
@@ -171,9 +193,20 @@ final class WebSocketManager: ObservableObject {
             print("[WebSocketManager] Decryption failed — dropping message")
             return
         }
+
+        // Decrypt the image payload if present.
+        var decryptedImage: String? = nil
+        if let encryptedImage = raw.imageBase64 {
+            decryptedImage = CryptoManager.shared.decrypt(base64String: encryptedImage)
+            if decryptedImage == nil {
+                print("[WebSocketManager] Image decryption failed — showing message without image")
+            }
+        }
+
         let chatMessage = ChatMessage(
             id: raw.id, senderId: raw.senderId,
-            senderName: raw.senderName, text: decryptedText, timestamp: raw.timestamp
+            senderName: raw.senderName, text: decryptedText,
+            timestamp: raw.timestamp, imageBase64: decryptedImage
         )
         DispatchQueue.main.async { self.messages.append(chatMessage) }
     }
@@ -211,6 +244,50 @@ final class WebSocketManager: ObservableObject {
         guard !isSignal else { return }
         let local = ChatMessage(senderId: senderId, senderName: senderName, text: text)
         DispatchQueue.main.async { self.messages.append(local) }
+    }
+
+    // MARK: - Send Image
+
+    /// Compresses, encrypts and sends a UIImage over WebSocket.
+    /// The sender sees their own image immediately (plain Base64 appended locally).
+    /// The receiver gets the encrypted payload and decrypts it in handleIncoming().
+    func sendImage(image: UIImage, senderId: String, senderName: String) {
+        // 1. Compress to JPEG to keep the WebSocket payload manageable.
+        guard let imageData = image.jpegData(compressionQuality: 0.3) else {
+            print("[WebSocketManager] sendImage: JPEG compression failed")
+            return
+        }
+
+        // 2. Plain Base64 — used for local display only.
+        let plainBase64 = imageData.base64EncodedString()
+
+        // 3. Encrypt the Base64 string before sending over the wire.
+        guard let encryptedBase64 = CryptoManager.shared.encrypt(message: plainBase64) else {
+            print("[WebSocketManager] sendImage: encryption failed")
+            return
+        }
+
+        // 4. Encrypt the text field too ("[Image]" placeholder).
+        guard let encryptedText = CryptoManager.shared.encrypt(message: "[Image]") else { return }
+
+        // 5. Build and send the wire message (encrypted image + encrypted text).
+        let wireMessage = ChatMessage(
+            senderId: senderId, senderName: senderName,
+            text: encryptedText, imageBase64: encryptedBase64
+        )
+        guard let data = try? encoder.encode(wireMessage),
+              let json = String(data: data, encoding: .utf8) else { return }
+
+        task?.send(.string(json)) { error in
+            if let error { print("[WebSocketManager] sendImage error: \(error.localizedDescription)") }
+        }
+
+        // 6. Append locally with PLAIN Base64 so sender sees their image immediately.
+        let localMessage = ChatMessage(
+            senderId: senderId, senderName: senderName,
+            text: "[Image]", imageBase64: plainBase64
+        )
+        DispatchQueue.main.async { self.messages.append(localMessage) }
     }
 
     // MARK: - Typing Signal
