@@ -25,10 +25,14 @@ This project is not a tutorial clone. Every architectural decision — from the 
 ## ✨ Core Features
 
 ### 🔒 End-to-End Encryption (E2EE)
-- All messages and media are encrypted **on-device before transmission** using Apple's **CryptoKit** framework
-- Implements **AES-GCM** (256-bit) authenticated encryption — the same algorithm underpinning TLS 1.3
-- Every message carries its own unique **nonce**, preventing replay attacks
-- Images are compressed, encrypted, and transmitted as Base64-encoded ciphertext — never as plaintext bytes over the wire
+
+Messages and media are encrypted **on-device before transmission** — the server only ever relays opaque ciphertext and cannot read content.
+
+- **Algorithm:** AES-GCM 256-bit via `CryptoKit` — provides **confidentiality** + **tamper detection** (GCM auth tag) in one operation. Same cipher as TLS 1.3, Signal, and iMessage.
+- **Sealed Box:** Each payload = `[12-byte Nonce | Ciphertext | 16-byte Auth Tag]` → Base64-encoded → sent over WebSocket. Unique nonce per message prevents replay attacks.
+- **Flow:** `Plaintext → CryptoManager.encrypt() → AES.GCM.seal() → Base64 → WebSocket → Base64 → AES.GCM.open() → Plaintext`
+- **Key model (demo):** Pre-shared 256-bit symmetric key in `CryptoManager.sharedSymmetricKey` — sufficient for two-simulator testing without a key exchange round-trip.
+- **Production path:** Swap to per-user **Curve25519 key pairs** + **HKDF** derivation following the [Signal Protocol / X3DH](https://signal.org/docs/specifications/x3dh/) spec — outlined in `CryptoManager.swift` comments.
 
 ### ⚡ Real-Time Communication
 - Powered by **`URLSessionWebSocketTask`** — Apple's native WebSocket API — for persistent, low-latency bidirectional messaging
