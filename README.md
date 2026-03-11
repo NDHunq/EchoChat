@@ -20,6 +20,8 @@ This project is not a tutorial clone. Every architectural decision — from the 
 
 > **Target Audience:** Recruiting teams, senior iOS engineers, and tech leads evaluating candidates for roles involving real-time systems, security engineering, or native iOS architecture.
 
+https://github.com/user-attachments/assets/68b86d4f-3660-4b95-8ce6-ff832ade74a7
+
 ---
 
 ## ✨ Core Features
